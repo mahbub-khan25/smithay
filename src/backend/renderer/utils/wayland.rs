@@ -199,14 +199,21 @@ impl RendererSurfaceState {
         if new_buffer {
             let buffer_damage = attrs.damage.drain(..).flat_map(|dmg| {
                 match dmg {
-                    Damage::Buffer(rect) => rect,
-                    Damage::Surface(rect) => surface_view.rect_to_local(rect).to_i32_up().to_buffer(
-                        self.buffer_scale,
-                        self.buffer_transform,
-                        &surface_size,
-                    ),
+                    Damage::Buffer(rect) => Some(rect),
+                    // Cut surface damage to the surface before it is rounded and transformed:
+                    // a client may send any `i32`, and nothing outside the surface is kept anyway.
+                    Damage::Surface(rect) => surface_view
+                        .rect_to_local(rect)
+                        .intersection(Rectangle::from_size(surface_size.to_f64()))
+                        .map(|rect| {
+                            rect.to_i32_up().to_buffer(
+                                self.buffer_scale,
+                                self.buffer_transform,
+                                &surface_size,
+                            )
+                        }),
                 }
-                .intersection(Rectangle::from_size(buffer_dimensions))
+                .and_then(|rect| rect.intersection(Rectangle::from_size(buffer_dimensions)))
             });
             self.damage.add(buffer_damage);
         }

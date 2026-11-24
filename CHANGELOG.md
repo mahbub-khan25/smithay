@@ -368,8 +368,9 @@ calls `create_frame` while the session still has an active frame, as the protoco
 the request was accepted and the extra frame was silently added to the session.
 
 `zwlr_layer_surface_v1.set_size` now posts an `invalid_size` error when the width or height does not
-fit in an `i32`. Previously the value was cast to a negative `i32`, which panicked in debug builds
-and stored a negative size in release builds.
+fit in an `i32`, which disconnects the client, as wlroots does (wlroots posts an implementation error;
+this posts the more specific `invalid_size`). Previously the value was cast to a negative `i32`, which
+panicked in debug builds and stored a negative size in release builds.
 
 `PositionerState::get_anchor_point`, `get_geometry` and `get_unconstrained_geometry` no longer
 overflow on extreme client-supplied anchor rectangles or offsets. Previously a client could panic the
@@ -380,6 +381,11 @@ and an exclusive zone (with its margin) reserves between nothing and what is lef
 Previously a client could move or grow the area left for the other layer surfaces past the output with
 a negative margin or an extreme exclusive zone, so their surfaces were configured larger than the
 output or placed far off it.
+
+`Transform::transform_point_in` and `Transform::transform_rect_in` now use saturating arithmetic, and
+surface damage is cut to the surface before it is converted to buffer coordinates. Previously a client
+could panic the compositor, when overflow checks are enabled, with damage at extreme coordinates on a
+buffer with a transform. Results for values in range are unchanged.
 
 ## 0.7.0
 

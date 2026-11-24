@@ -1903,20 +1903,25 @@ impl Transform {
     }
 
     /// Transforms a point inside an area of a given size by applying this transformation.
+    ///
+    /// The arithmetic saturates at the numeric bounds, so points far outside the area (for
+    /// example from client-supplied values) cannot overflow.
     pub fn transform_point_in<N: Coordinate, Kind>(
         &self,
         point: Point<N, Kind>,
         area: &Size<N, Kind>,
     ) -> Point<N, Kind> {
+        let flip_x = || area.w.saturating_sub(point.x);
+        let flip_y = || area.h.saturating_sub(point.y);
         match *self {
             Transform::Normal => point,
-            Transform::_90 => (area.h - point.y, point.x).into(),
-            Transform::_180 => (area.w - point.x, area.h - point.y).into(),
-            Transform::_270 => (point.y, area.w - point.x).into(),
-            Transform::Flipped => (area.w - point.x, point.y).into(),
+            Transform::_90 => (flip_y(), point.x).into(),
+            Transform::_180 => (flip_x(), flip_y()).into(),
+            Transform::_270 => (point.y, flip_x()).into(),
+            Transform::Flipped => (flip_x(), point.y).into(),
             Transform::Flipped90 => (point.y, point.x).into(),
-            Transform::Flipped180 => (point.x, area.h - point.y).into(),
-            Transform::Flipped270 => (area.h - point.y, area.w - point.x).into(),
+            Transform::Flipped180 => (point.x, flip_y()).into(),
+            Transform::Flipped270 => (flip_y(), flip_x()).into(),
         }
     }
 
@@ -1934,29 +1939,26 @@ impl Transform {
     }
 
     /// Transforms a rectangle inside an area of a given size by applying this transformation.
+    ///
+    /// The arithmetic saturates at the numeric bounds, so rectangles far outside the area
+    /// (for example client-supplied damage) cannot overflow.
     pub fn transform_rect_in<N: Coordinate, Kind>(
         &self,
         rect: Rectangle<N, Kind>,
         area: &Size<N, Kind>,
     ) -> Rectangle<N, Kind> {
         let size = self.transform_size(rect.size);
+        let flip_x = || area.w.saturating_sub(rect.loc.x).saturating_sub(rect.size.w);
+        let flip_y = || area.h.saturating_sub(rect.loc.y).saturating_sub(rect.size.h);
 
         let loc = match *self {
             Transform::Normal => rect.loc,
-            Transform::_90 => (area.h - rect.loc.y - rect.size.h, rect.loc.x).into(),
-            Transform::_180 => (
-                area.w - rect.loc.x - rect.size.w,
-                area.h - rect.loc.y - rect.size.h,
-            )
-                .into(),
-            Transform::_270 => (rect.loc.y, area.w - rect.loc.x - rect.size.w).into(),
-            Transform::Flipped => (area.w - rect.loc.x - rect.size.w, rect.loc.y).into(),
-            Transform::Flipped90 => (
-                area.h - rect.loc.y - rect.size.h,
-                area.w - rect.loc.x - rect.size.w,
-            )
-                .into(),
-            Transform::Flipped180 => (rect.loc.x, area.h - rect.loc.y - rect.size.h).into(),
+            Transform::_90 => (flip_y(), rect.loc.x).into(),
+            Transform::_180 => (flip_x(), flip_y()).into(),
+            Transform::_270 => (rect.loc.y, flip_x()).into(),
+            Transform::Flipped => (flip_x(), rect.loc.y).into(),
+            Transform::Flipped90 => (flip_y(), flip_x()).into(),
+            Transform::Flipped180 => (rect.loc.x, flip_y()).into(),
             Transform::Flipped270 => (rect.loc.y, rect.loc.x).into(),
         };
 
@@ -2023,7 +2025,7 @@ impl From<Transform> for WlTransform {
 
 #[cfg(test)]
 mod tests {
-    use super::{Logical, Rectangle, Size, Transform};
+    use super::{Buffer, Logical, Point, Rectangle, Size, Transform};
 
     #[test]
     fn transform_rect_ident() {
@@ -2291,5 +2293,97 @@ mod tests {
         assert_eq!(smaller - bigger, Size::from((0, 0)));
         smaller -= bigger;
         assert_eq!(smaller, Size::from((0, 0)));
+    }
+
+    const ALL_TRANSFORMS: [Transform; 8] = [
+        Transform::Normal,
+        Transform::_90,
+        Transform::_180,
+        Transform::_270,
+        Transform::Flipped,
+        Transform::Flipped90,
+        Transform::Flipped180,
+        Transform::Flipped270,
+    ];
+
+    #[test]
+    fn transform_point_in_area() {
+        let point = Point::<i32, Logical>::from((10, 5));
+        let area = Size::from((100, 50));
+        let expected = [
+            (10, 5),
+            (45, 10),
+            (90, 45),
+            (5, 90),
+            (90, 5),
+            (5, 10),
+            (10, 45),
+            (45, 90),
+        ];
+        for (transform, expected) in ALL_TRANSFORMS.into_iter().zip(expected) {
+            assert_eq!(
+                transform.transform_point_in(point, &area),
+                Point::from(expected),
+                "{transform:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn transform_point_in_saturates() {
+        let area = Size::<i32, Logical>::from((100, 50));
+        for transform in ALL_TRANSFORMS {
+            for xy in [i32::MIN, i32::MIN + 1, -1, i32::MAX - 1, i32::MAX] {
+                for point in [(xy, 0), (0, xy), (xy, xy)] {
+                    // Must not overflow; each coordinate stays an `i32` at the bounds.
+                    let _ = transform.transform_point_in(Point::from(point), &area);
+                }
+            }
+        }
+        assert_eq!(
+            Transform::_180.transform_point_in(Point::<i32, Logical>::from((i32::MIN, i32::MAX)), &area),
+            Point::from((i32::MAX, 50 - i32::MAX))
+        );
+    }
+
+    #[test]
+    fn transform_rect_in_saturates() {
+        let area = Size::<i32, Logical>::from((100, 50));
+        for transform in ALL_TRANSFORMS {
+            for xy in [i32::MIN, i32::MIN + 1, -1, i32::MAX - 1, i32::MAX] {
+                for loc in [(xy, 0), (0, xy), (xy, xy)] {
+                    for size in [(1, 1), (i32::MAX, i32::MAX)] {
+                        let rect = Rectangle::new(loc.into(), size.into());
+                        let out = transform.transform_rect_in(rect, &area);
+                        assert_eq!(out.size, transform.transform_size(rect.size), "{transform:?}");
+                    }
+                }
+            }
+        }
+        assert_eq!(
+            Transform::_180.transform_rect_in(
+                Rectangle::<i32, Logical>::new((i32::MIN, 0).into(), (1, 1).into()),
+                &area
+            ),
+            Rectangle::new((i32::MAX - 1, 49).into(), (1, 1).into())
+        );
+    }
+
+    #[test]
+    fn rect_to_buffer_with_extreme_damage() {
+        // Damage a client may send on a buffer with a transform.
+        let area = Size::<i32, Logical>::from((100, 100));
+        for transform in ALL_TRANSFORMS {
+            for loc in [(i32::MIN, 0), (0, i32::MIN), (i32::MAX, i32::MAX)] {
+                let rect = Rectangle::<i32, Logical>::new(loc.into(), (1, 1).into());
+                let buffer: Rectangle<i32, Buffer> = rect.to_buffer(1, transform, &area);
+                assert!(
+                    buffer
+                        .intersection(Rectangle::from_size((100, 100).into()))
+                        .is_none(),
+                    "{transform:?} {loc:?}: {buffer:?}"
+                );
+            }
+        }
     }
 }
