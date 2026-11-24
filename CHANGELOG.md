@@ -371,6 +371,10 @@ the request was accepted and the extra frame was silently added to the session.
 fit in an `i32`. Previously the value was cast to a negative `i32`, which panicked in debug builds
 and stored a negative size in release builds.
 
+`PositionerState::get_anchor_point`, `get_geometry` and `get_unconstrained_geometry` no longer
+overflow on extreme client-supplied anchor rectangles or offsets. Previously a client could panic the
+compositor with a single `xdg_surface.get_popup` when overflow checks are enabled.
+
 ## 0.7.0
 
 ### Breaking changes
