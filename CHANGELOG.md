@@ -367,6 +367,10 @@ blocking the compositor while they resume.
 calls `create_frame` while the session still has an active frame, as the protocol requires. Previously
 the request was accepted and the extra frame was silently added to the session.
 
+`zwlr_layer_surface_v1.set_size` now posts an `invalid_size` error when the width or height does not
+fit in an `i32`. Previously the value was cast to a negative `i32`, which panicked in debug builds
+and stored a negative size in release builds.
+
 ## 0.7.0
 
 ### Breaking changes

@@ -186,8 +186,16 @@ where
     ) {
         match request {
             zwlr_layer_surface_v1::Request::SetSize { width, height } => {
+                let (Ok(width), Ok(height)) = (i32::try_from(width), i32::try_from(height)) else {
+                    layer_surface.post_error(
+                        zwlr_layer_surface_v1::Error::InvalidSize,
+                        "width and height can't be greater than i32::MAX",
+                    );
+                    return;
+                };
+
                 let _ = with_surface_pending_state(layer_surface, |data| {
-                    data.size = (width as i32, height as i32).into();
+                    data.size = (width, height).into();
                 });
             }
             zwlr_layer_surface_v1::Request::SetAnchor { anchor } => {
@@ -389,4 +397,157 @@ pub fn make_surface_handle(
         wl_surface,
         shell_surface: resource.clone(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{os::unix::net::UnixStream, sync::Arc};
+
+    use wayland_client::{
+        Connection, Dispatch as ClientDispatch, EventQueue, QueueHandle,
+        protocol::{wl_compositor, wl_registry, wl_surface as client_wl_surface},
+    };
+    use wayland_protocols_wlr::layer_shell::v1::client::{
+        zwlr_layer_shell_v1 as client_layer_shell, zwlr_layer_surface_v1 as client_layer_surface,
+    };
+    use wayland_server::{Display, backend::ClientData, protocol::wl_output::WlOutput};
+
+    use super::*;
+    use crate::wayland::compositor::{CompositorClientState, CompositorHandler, CompositorState};
+    use crate::wayland::shell::wlr_layer::LayerSurface;
+
+    struct ServerState {
+        compositor: CompositorState,
+        layer_shell: WlrLayerShellState,
+    }
+
+    #[derive(Default)]
+    struct ServerClientData(CompositorClientState);
+
+    impl ClientData for ServerClientData {}
+
+    impl CompositorHandler for ServerState {
+        fn compositor_state(&mut self) -> &mut CompositorState {
+            &mut self.compositor
+        }
+
+        fn client_compositor_state<'a>(&self, client: &'a Client) -> &'a CompositorClientState {
+            &client.get_data::<ServerClientData>().unwrap().0
+        }
+
+        fn commit(&mut self, _surface: &wl_surface::WlSurface) {}
+    }
+
+    impl WlrLayerShellHandler for ServerState {
+        fn shell_state(&mut self) -> &mut WlrLayerShellState {
+            &mut self.layer_shell
+        }
+
+        fn new_layer_surface(
+            &mut self,
+            _surface: LayerSurface,
+            _output: Option<WlOutput>,
+            _layer: Layer,
+            _namespace: String,
+        ) {
+        }
+    }
+
+    crate::delegate_dispatch2!(ServerState);
+
+    #[derive(Default)]
+    struct ClientState {
+        globals: Vec<(u32, String, u32)>,
+    }
+
+    impl ClientDispatch<wl_registry::WlRegistry, ()> for ClientState {
+        fn event(
+            state: &mut Self,
+            _: &wl_registry::WlRegistry,
+            event: wl_registry::Event,
+            _: &(),
+            _: &Connection,
+            _: &QueueHandle<Self>,
+        ) {
+            if let wl_registry::Event::Global {
+                name,
+                interface,
+                version,
+            } = event
+            {
+                state.globals.push((name, interface, version));
+            }
+        }
+    }
+
+    wayland_client::delegate_noop!(ClientState: ignore wl_compositor::WlCompositor);
+    wayland_client::delegate_noop!(ClientState: ignore client_wl_surface::WlSurface);
+    wayland_client::delegate_noop!(ClientState: ignore client_layer_shell::ZwlrLayerShellV1);
+    wayland_client::delegate_noop!(ClientState: ignore client_layer_surface::ZwlrLayerSurfaceV1);
+
+    fn roundtrip(
+        display: &mut Display<ServerState>,
+        server: &mut ServerState,
+        conn: &Connection,
+        queue: &mut EventQueue<ClientState>,
+        client: &mut ClientState,
+    ) {
+        conn.flush().unwrap();
+        display.dispatch_clients(server).unwrap();
+        display.flush_clients().unwrap();
+        if let Some(guard) = conn.prepare_read() {
+            let _ = guard.read();
+        }
+        let _ = queue.dispatch_pending(client);
+    }
+
+    #[test]
+    fn set_size_above_i32_max_is_a_protocol_error() {
+        let mut display = Display::<ServerState>::new().unwrap();
+        let mut dh = display.handle();
+        let mut server = ServerState {
+            compositor: CompositorState::new::<ServerState>(&dh),
+            layer_shell: WlrLayerShellState::new::<ServerState>(&dh),
+        };
+
+        let (server_stream, client_stream) = UnixStream::pair().unwrap();
+        dh.insert_client(server_stream, Arc::new(ServerClientData::default()))
+            .unwrap();
+        let conn = Connection::from_socket(client_stream).unwrap();
+        let mut queue = conn.new_event_queue::<ClientState>();
+        let qh = queue.handle();
+        let mut client = ClientState::default();
+
+        let registry = conn.display().get_registry(&qh, ());
+        roundtrip(&mut display, &mut server, &conn, &mut queue, &mut client);
+
+        let global = |interface: &str| {
+            client
+                .globals
+                .iter()
+                .find(|(_, i, _)| i == interface)
+                .map(|&(name, _, version)| (name, version))
+                .unwrap()
+        };
+        let (name, version) = global("wl_compositor");
+        let compositor = registry.bind::<wl_compositor::WlCompositor, _, _>(name, version, &qh, ());
+        let (name, version) = global("zwlr_layer_shell_v1");
+        let layer_shell = registry.bind::<client_layer_shell::ZwlrLayerShellV1, _, _>(name, version, &qh, ());
+
+        let surface = compositor.create_surface(&qh, ());
+        let layer_surface = layer_shell.get_layer_surface(
+            &surface,
+            None,
+            client_layer_shell::Layer::Top,
+            String::from("test"),
+            &qh,
+            (),
+        );
+        layer_surface.set_size(u32::MAX, 1);
+        roundtrip(&mut display, &mut server, &conn, &mut queue, &mut client);
+
+        let error = conn.protocol_error().expect("expected a protocol error");
+        assert_eq!(error.object_interface, "zwlr_layer_surface_v1");
+        assert_eq!(error.code, zwlr_layer_surface_v1::Error::InvalidSize as u32);
+    }
 }
