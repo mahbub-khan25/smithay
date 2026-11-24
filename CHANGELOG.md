@@ -375,6 +375,12 @@ and stored a negative size in release builds.
 overflow on extreme client-supplied anchor rectangles or offsets. Previously a client could panic the
 compositor with a single `xdg_surface.get_popup` when overflow checks are enabled.
 
+`LayerMap::arrange` now keeps each layer surface's margins within the output's size on their axis,
+and an exclusive zone (with its margin) reserves between nothing and what is left of the output.
+Previously a client could move or grow the area left for the other layer surfaces past the output with
+a negative margin or an extreme exclusive zone, so their surfaces were configured larger than the
+output or placed far off it.
+
 ## 0.7.0
 
 ### Breaking changes

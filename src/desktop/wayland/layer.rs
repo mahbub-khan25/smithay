@@ -9,7 +9,7 @@ use crate::{
         seat::WaylandFocus,
         shell::wlr_layer::{
             Anchor, ExclusiveZone, KeyboardInteractivity, Layer as WlrLayer, LayerSurface as WlrLayerSurface,
-            LayerSurfaceCachedState, LayerSurfaceData,
+            LayerSurfaceCachedState, LayerSurfaceData, Margins,
         },
     },
 };
@@ -307,90 +307,7 @@ impl LayerMap {
                 }
 
                 let data = layer.cached_state();
-
-                let mut source = match data.exclusive_zone {
-                    ExclusiveZone::Exclusive(_) | ExclusiveZone::Neutral => zone,
-                    ExclusiveZone::DontCare => Rectangle::new(
-                        Point::new(Saturating(output_rect.loc.x), Saturating(output_rect.loc.y)),
-                        Size::new(Saturating(output_rect.size.w), Saturating(output_rect.size.h)),
-                    ),
-                };
-
-                // adjust the copy rect to account for the margins
-                if data.anchor.contains(Anchor::LEFT) {
-                    source.size.w -= data.margin.left
-                }
-                if data.anchor.contains(Anchor::RIGHT) {
-                    source.size.w -= data.margin.right
-                }
-                if data.anchor.contains(Anchor::TOP) {
-                    source.size.h -= data.margin.top
-                }
-                if data.anchor.contains(Anchor::BOTTOM) {
-                    source.size.h -= data.margin.bottom
-                }
-
-                let mut size: Size<_, Logical> = Size::new(Saturating(data.size.w), Saturating(data.size.h));
-                size.w = size.w.min(source.size.w);
-                size.h = size.h.min(source.size.h);
-                if size.w.0 == 0 {
-                    size.w.0 = source.size.w.0 / 2;
-                }
-                if size.h.0 == 0 {
-                    size.h.0 = source.size.h.0 / 2;
-                }
-                if data.anchor.anchored_horizontally() {
-                    size.w = source.size.w;
-                }
-                if data.anchor.anchored_vertically() {
-                    size.h = source.size.h;
-                }
-
-                let x = if data.anchor.contains(Anchor::LEFT) {
-                    source.loc.x + Saturating(data.margin.left)
-                } else if data.anchor.contains(Anchor::RIGHT) {
-                    source.loc.x + (source.size.w - size.w)
-                } else {
-                    source.loc.x + Saturating((source.size.w.0 / 2) - (size.w.0 / 2))
-                };
-
-                let y = if data.anchor.contains(Anchor::TOP) {
-                    source.loc.y + Saturating(data.margin.top)
-                } else if data.anchor.contains(Anchor::BOTTOM) {
-                    source.loc.y + (source.size.h - size.h)
-                } else {
-                    source.loc.y + Saturating((source.size.h.0 / 2) - (size.h.0 / 2))
-                };
-
-                let location: Point<i32, Logical> = (x.0, y.0).into();
-
-                if let ExclusiveZone::Exclusive(amount) = data.exclusive_zone {
-                    let amount = Saturating(amount as i32);
-
-                    match effective_exclusive_edge(&data) {
-                        Some(Anchor::TOP) => {
-                            let sum = amount + Saturating(data.margin.top);
-                            zone.loc.y += sum;
-                            zone.size.h -= sum;
-                        }
-                        Some(Anchor::BOTTOM) => {
-                            zone.size.h -= amount + Saturating(data.margin.bottom);
-                        }
-                        Some(Anchor::LEFT) => {
-                            let sum = amount + Saturating(data.margin.left);
-                            zone.loc.x += sum;
-                            zone.size.w -= sum;
-                        }
-                        Some(Anchor::RIGHT) => {
-                            zone.size.w -= amount + Saturating(data.margin.right);
-                        }
-                        // Exclusive edge is always exactly one edge
-                        Some(_) => unreachable!(),
-                        None => {}
-                    }
-                }
-
-                let size = Size::new(size.w.0.max(0), size.h.0.max(0));
+                let (location, size) = place_layer(output_rect, &mut zone, &data);
                 trace!("Setting layer to pos {:?} and size {:?}", location, size);
                 let size_changed = layer.0.surface.with_pending_state(|state| {
                     state.size.replace(size).map(|old| old != size).unwrap_or(true)
@@ -456,6 +373,121 @@ impl LayerMap {
     pub fn len(&self) -> usize {
         self.layers.len()
     }
+}
+
+/// Places one layer surface on an output of `output_rect`: its location and size, taking its
+/// exclusive zone (if any) off `zone`, the area left for the surfaces arranged after it.
+fn place_layer(
+    output_rect: Rectangle<i32, Logical>,
+    zone: &mut Rectangle<Saturating<i32>, Logical>,
+    data: &LayerSurfaceCachedState,
+) -> (Point<i32, Logical>, Size<i32, Logical>) {
+    // The protocol puts no bounds on margins and exclusive zones, so a client could send
+    // any `i32`. A margin is kept within the output's size on its axis: beyond that, the
+    // surface is placed as if it were exactly that far, which is wholly off the output or
+    // slid fully past its edge either way. An exclusive zone reserves at most what is left
+    // of `zone` on its axis and never less than nothing, so no client can grow `zone` past
+    // the output or move it off the output for the surfaces arranged after it.
+    let (w, h) = (output_rect.size.w.max(0), output_rect.size.h.max(0));
+    let margin = Margins {
+        top: data.margin.top.clamp(-h, h),
+        right: data.margin.right.clamp(-w, w),
+        bottom: data.margin.bottom.clamp(-h, h),
+        left: data.margin.left.clamp(-w, w),
+    };
+
+    let mut source = match data.exclusive_zone {
+        ExclusiveZone::Exclusive(_) | ExclusiveZone::Neutral => *zone,
+        ExclusiveZone::DontCare => Rectangle::new(
+            Point::new(Saturating(output_rect.loc.x), Saturating(output_rect.loc.y)),
+            Size::new(Saturating(output_rect.size.w), Saturating(output_rect.size.h)),
+        ),
+    };
+
+    // adjust the copy rect to account for the margins
+    if data.anchor.contains(Anchor::LEFT) {
+        source.size.w -= margin.left
+    }
+    if data.anchor.contains(Anchor::RIGHT) {
+        source.size.w -= margin.right
+    }
+    if data.anchor.contains(Anchor::TOP) {
+        source.size.h -= margin.top
+    }
+    if data.anchor.contains(Anchor::BOTTOM) {
+        source.size.h -= margin.bottom
+    }
+
+    let mut size: Size<_, Logical> = Size::new(Saturating(data.size.w), Saturating(data.size.h));
+    size.w = size.w.min(source.size.w);
+    size.h = size.h.min(source.size.h);
+    if size.w.0 == 0 {
+        size.w.0 = source.size.w.0 / 2;
+    }
+    if size.h.0 == 0 {
+        size.h.0 = source.size.h.0 / 2;
+    }
+    if data.anchor.anchored_horizontally() {
+        size.w = source.size.w;
+    }
+    if data.anchor.anchored_vertically() {
+        size.h = source.size.h;
+    }
+
+    let x = if data.anchor.contains(Anchor::LEFT) {
+        source.loc.x + Saturating(margin.left)
+    } else if data.anchor.contains(Anchor::RIGHT) {
+        source.loc.x + (source.size.w - size.w)
+    } else {
+        source.loc.x + Saturating((source.size.w.0 / 2) - (size.w.0 / 2))
+    };
+
+    let y = if data.anchor.contains(Anchor::TOP) {
+        source.loc.y + Saturating(margin.top)
+    } else if data.anchor.contains(Anchor::BOTTOM) {
+        source.loc.y + (source.size.h - size.h)
+    } else {
+        source.loc.y + Saturating((source.size.h.0 / 2) - (size.h.0 / 2))
+    };
+
+    let location: Point<i32, Logical> = (x.0, y.0).into();
+
+    if let ExclusiveZone::Exclusive(amount) = data.exclusive_zone {
+        let amount = i32::try_from(amount).unwrap_or(i32::MAX);
+        // What the zone and its margin take off what is left of `zone` on that axis.
+        let reserve = |margin: i32, room: Saturating<i32>| {
+            Saturating(
+                (Saturating(amount) + Saturating(margin))
+                    .0
+                    .clamp(0, room.0.max(0)),
+            )
+        };
+
+        match effective_exclusive_edge(data) {
+            Some(Anchor::TOP) => {
+                let sum = reserve(margin.top, zone.size.h);
+                zone.loc.y += sum;
+                zone.size.h -= sum;
+            }
+            Some(Anchor::BOTTOM) => {
+                zone.size.h -= reserve(margin.bottom, zone.size.h);
+            }
+            Some(Anchor::LEFT) => {
+                let sum = reserve(margin.left, zone.size.w);
+                zone.loc.x += sum;
+                zone.size.w -= sum;
+            }
+            Some(Anchor::RIGHT) => {
+                zone.size.w -= reserve(margin.right, zone.size.w);
+            }
+            // Exclusive edge is always exactly one edge
+            Some(_) => unreachable!(),
+            None => {}
+        }
+    }
+
+    let size = Size::new(size.w.0.max(0), size.h.0.max(0));
+    (location, size)
 }
 
 fn effective_exclusive_edge(data: &LayerSurfaceCachedState) -> Option<Anchor> {
@@ -763,6 +795,110 @@ impl WaylandFocus for LayerSurface {
 #[cfg(test)]
 mod test {
     use super::*;
+
+    fn output() -> Rectangle<i32, Logical> {
+        Rectangle::from_size((1920, 1080).into())
+    }
+
+    fn zone_of(rect: Rectangle<i32, Logical>) -> Rectangle<Saturating<i32>, Logical> {
+        Rectangle::new(
+            Point::new(Saturating(rect.loc.x), Saturating(rect.loc.y)),
+            Size::new(Saturating(rect.size.w), Saturating(rect.size.h)),
+        )
+    }
+
+    fn layer(
+        anchor: Anchor,
+        size: (i32, i32),
+        zone: ExclusiveZone,
+        margin: Margins,
+    ) -> LayerSurfaceCachedState {
+        LayerSurfaceCachedState {
+            size: size.into(),
+            anchor,
+            exclusive_zone: zone,
+            margin,
+            ..Default::default()
+        }
+    }
+
+    fn inside(outer: Rectangle<i32, Logical>, zone: &Rectangle<Saturating<i32>, Logical>) -> bool {
+        let zone = Rectangle::new(
+            Point::new(zone.loc.x.0, zone.loc.y.0),
+            Size::new(zone.size.w.0, zone.size.h.0),
+        );
+        zone.size.w >= 0 && zone.size.h >= 0 && outer.contains_rect(zone)
+    }
+
+    #[test]
+    fn absurd_margins_and_zones_do_not_move_later_layers_off_the_output() {
+        let output = output();
+        let wild = Margins {
+            top: i32::MAX,
+            right: i32::MAX,
+            bottom: i32::MIN,
+            left: i32::MIN,
+        };
+        for first in [
+            layer(Anchor::LEFT, (300, 200), ExclusiveZone::Exclusive(50), wild),
+            layer(Anchor::LEFT, (300, 200), ExclusiveZone::Exclusive(u32::MAX), wild),
+            layer(Anchor::BOTTOM, (300, 200), ExclusiveZone::Exclusive(50), wild),
+            layer(
+                Anchor::TOP,
+                (300, 200),
+                ExclusiveZone::Exclusive(50),
+                Margins {
+                    top: i32::MIN,
+                    ..Default::default()
+                },
+            ),
+            layer(
+                Anchor::RIGHT,
+                (300, 200),
+                ExclusiveZone::Exclusive(u32::MAX),
+                Margins {
+                    right: i32::MAX,
+                    ..Default::default()
+                },
+            ),
+        ] {
+            let mut zone = zone_of(output);
+            place_layer(output, &mut zone, &first);
+            assert!(inside(output, &zone), "{first:?}: {zone:?}");
+
+            // A second surface, maybe of another client, that asks for everything.
+            let second = layer(
+                Anchor::LEFT,
+                (i32::MAX, i32::MAX),
+                ExclusiveZone::Neutral,
+                Margins::default(),
+            );
+            let (loc, size) = place_layer(output, &mut zone, &second);
+            assert!(
+                output.contains_rect(Rectangle::new(loc, size)),
+                "{first:?}: {loc:?} {size:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_negative_margin_still_lets_a_surface_slide_past_its_edge() {
+        // A bar of 40 that slides up out of view keeps its size and its zone.
+        let output = output();
+        let mut zone = zone_of(output);
+        let bar = layer(
+            Anchor::TOP | Anchor::LEFT | Anchor::RIGHT,
+            (0, 40),
+            ExclusiveZone::Exclusive(40),
+            Margins {
+                top: -30,
+                ..Default::default()
+            },
+        );
+        let (loc, size) = place_layer(output, &mut zone, &bar);
+        assert_eq!((loc, size), ((0, -30).into(), (1920, 40).into()));
+        assert_eq!((zone.loc.y.0, zone.size.h.0), (10, 1070));
+    }
 
     #[test]
     fn test_implied_exclusive_edge() {
