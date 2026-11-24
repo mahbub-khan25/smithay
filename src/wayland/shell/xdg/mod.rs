@@ -578,9 +578,7 @@ impl PositionerState {
     /// Defined by `xdg_positioner.set_anchor_rect` and
     /// `xdg_positioner.set_anchor`.
     pub fn get_anchor_point(&self) -> Point<i32, Logical> {
-        let mut point = self.anchor_rect.loc;
-
-        point.y += if self.anchor_has_edge(xdg_positioner::Anchor::Top) {
+        let y = if self.anchor_has_edge(xdg_positioner::Anchor::Top) {
             0
         } else if self.anchor_has_edge(xdg_positioner::Anchor::Bottom) {
             self.anchor_rect.size.h
@@ -588,7 +586,7 @@ impl PositionerState {
             self.anchor_rect.size.h / 2
         };
 
-        point.x += if self.anchor_has_edge(xdg_positioner::Anchor::Left) {
+        let x = if self.anchor_has_edge(xdg_positioner::Anchor::Left) {
             0
         } else if self.anchor_has_edge(xdg_positioner::Anchor::Right) {
             self.anchor_rect.size.w
@@ -596,7 +594,8 @@ impl PositionerState {
             self.anchor_rect.size.w / 2
         };
 
-        point
+        // The anchor rectangle comes from the client, so use the saturating `Point` addition.
+        self.anchor_rect.loc + Point::from((x, y))
     }
 
     pub(crate) fn gravity_has_edge(&self, edge: xdg_positioner::Gravity) -> bool {
@@ -666,15 +665,15 @@ impl PositionerState {
         // surface will be centered over the anchor point on any axis that had no
         // gravity specified.
         if self.gravity_has_edge(xdg_positioner::Gravity::Top) {
-            geometry.loc.y -= geometry.size.h;
+            geometry.loc.y = geometry.loc.y.saturating_sub(geometry.size.h);
         } else if !self.gravity_has_edge(xdg_positioner::Gravity::Bottom) {
-            geometry.loc.y -= geometry.size.h / 2;
+            geometry.loc.y = geometry.loc.y.saturating_sub(geometry.size.h / 2);
         }
 
         if self.gravity_has_edge(xdg_positioner::Gravity::Left) {
-            geometry.loc.x -= geometry.size.w;
+            geometry.loc.x = geometry.loc.x.saturating_sub(geometry.size.w);
         } else if !self.gravity_has_edge(xdg_positioner::Gravity::Right) {
-            geometry.loc.x -= geometry.size.w / 2;
+            geometry.loc.x = geometry.loc.x.saturating_sub(geometry.size.w / 2);
         }
 
         geometry
@@ -750,7 +749,10 @@ impl PositionerState {
             if off_left > 0 {
                 geo.loc.x += off_left;
             } else if off_right > 0 {
-                geo.loc.x -= min(off_right, -off_left);
+                geo.loc.x = geo
+                    .loc
+                    .x
+                    .saturating_sub(min(off_right, off_left.saturating_neg()));
             }
 
             (off_left, off_right, _, _) = compute_offsets(target, geo);
@@ -766,7 +768,10 @@ impl PositionerState {
             if off_top > 0 {
                 geo.loc.y += off_top;
             } else if off_bottom > 0 {
-                geo.loc.y -= min(off_bottom, -off_top);
+                geo.loc.y = geo
+                    .loc
+                    .y
+                    .saturating_sub(min(off_bottom, off_top.saturating_neg()));
             }
 
             (_, _, off_top, off_bottom) = compute_offsets(target, geo);
@@ -808,10 +813,20 @@ impl PositionerState {
 }
 
 fn compute_offsets(target: Rectangle<i32, Logical>, popup: Rectangle<i32, Logical>) -> (i32, i32, i32, i32) {
-    let off_left = target.loc.x - popup.loc.x;
-    let off_right = (popup.loc.x + popup.size.w) - (target.loc.x + target.size.w);
-    let off_top = target.loc.y - popup.loc.y;
-    let off_bottom = (popup.loc.y + popup.size.h) - (target.loc.y + target.size.h);
+    // The popup position comes from the client, so its edges may be far outside the `i32` range
+    // of the target. Compute in `i64` and saturate the result.
+    let offsets = |target_start: i32, target_len: i32, popup_start: i32, popup_len: i32| {
+        let (target_start, popup_start) = (i64::from(target_start), i64::from(popup_start));
+        let target_end = target_start + i64::from(target_len);
+        let popup_end = popup_start + i64::from(popup_len);
+        let saturate = |offset: i64| offset.clamp(i32::MIN.into(), i32::MAX.into()) as i32;
+        (
+            saturate(target_start - popup_start),
+            saturate(popup_end - target_end),
+        )
+    };
+    let (off_left, off_right) = offsets(target.loc.x, target.size.w, popup.loc.x, popup.size.w);
+    let (off_top, off_bottom) = offsets(target.loc.y, target.size.h, popup.loc.y, popup.size.h);
     (off_left, off_right, off_top, off_bottom)
 }
 
@@ -2179,5 +2194,70 @@ impl From<PopupConfigure> for Configure {
     #[inline]
     fn from(configure: PopupConfigure) -> Self {
         Configure::Popup(configure)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn positioner_anchor_point_saturates() {
+        let positioner = PositionerState {
+            rect_size: (10, 10).into(),
+            anchor_rect: Rectangle::new((i32::MAX, i32::MAX).into(), (10, 10).into()),
+            anchor_edges: Anchor::BottomRight,
+            ..Default::default()
+        };
+        assert_eq!(positioner.get_anchor_point(), (i32::MAX, i32::MAX).into());
+        assert_eq!(positioner.get_geometry().loc, (i32::MAX - 5, i32::MAX - 5).into());
+    }
+
+    #[test]
+    fn positioner_gravity_saturates() {
+        let positioner = PositionerState {
+            rect_size: (10, 10).into(),
+            anchor_rect: Rectangle::new((0, 0).into(), (10, 10).into()),
+            anchor_edges: Anchor::TopLeft,
+            gravity: Gravity::TopLeft,
+            offset: (i32::MIN, i32::MIN).into(),
+            ..Default::default()
+        };
+        assert_eq!(positioner.get_geometry().loc, (i32::MIN, i32::MIN).into());
+    }
+
+    #[test]
+    fn positioner_unconstrain_far_popup() {
+        let target = Rectangle::new((0, 0).into(), (1920, 1080).into());
+        let positioner = PositionerState {
+            rect_size: (100, 100).into(),
+            anchor_rect: Rectangle::new((0, 0).into(), (10, 10).into()),
+            anchor_edges: Anchor::TopLeft,
+            gravity: Gravity::BottomRight,
+            constraint_adjustment: ConstraintAdjustment::all(),
+            offset: (i32::MAX - 10, i32::MAX - 10).into(),
+            ..Default::default()
+        };
+        // The popup's right and bottom edges are past i32::MAX. Sliding brings it back to the
+        // bottom-right corner of the target.
+        let geometry = positioner.get_unconstrained_geometry(target);
+        assert_eq!(geometry, Rectangle::new((1820, 980).into(), (100, 100).into()));
+    }
+
+    #[test]
+    fn positioner_slide_with_extreme_target() {
+        // The left and top constraint offsets reach i32::MIN here, which sliding negates.
+        let target = Rectangle::new((-1, -1).into(), (1, 1).into());
+        let positioner = PositionerState {
+            rect_size: (100, 100).into(),
+            anchor_rect: Rectangle::new((0, 0).into(), (10, 10).into()),
+            anchor_edges: Anchor::TopLeft,
+            gravity: Gravity::BottomRight,
+            constraint_adjustment: ConstraintAdjustment::SlideX | ConstraintAdjustment::SlideY,
+            offset: (i32::MAX, i32::MAX).into(),
+            ..Default::default()
+        };
+        let geometry = positioner.get_unconstrained_geometry(target);
+        assert_eq!(geometry.size, (100, 100).into());
     }
 }

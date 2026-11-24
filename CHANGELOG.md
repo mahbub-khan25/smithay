@@ -367,6 +367,10 @@ blocking the compositor while they resume.
 calls `create_frame` while the session still has an active frame, as the protocol requires. Previously
 the request was accepted and the extra frame was silently added to the session.
 
+`PositionerState::get_anchor_point`, `get_geometry` and `get_unconstrained_geometry` no longer
+overflow on extreme client-supplied anchor rectangles or offsets. Previously a client could panic the
+compositor with a single `xdg_surface.get_popup` when overflow checks are enabled.
+
 ## 0.7.0
 
 ### Breaking changes
