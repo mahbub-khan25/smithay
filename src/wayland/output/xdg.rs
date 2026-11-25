@@ -12,7 +12,7 @@ use wayland_server::{
     protocol::wl_output::{self, WlOutput},
 };
 
-use crate::utils::{Logical, Physical, Point, Size, Transform};
+use crate::utils::{Client, Logical, Physical, Point, Size, Transform};
 
 use super::{Mode, OutputUserData, Scale, XdgOutputUserData};
 
@@ -27,6 +27,24 @@ pub(crate) struct Inner {
     transform: Transform,
 
     pub instances: Vec<Weak<ZxdgOutputV1>>,
+}
+
+/// The size sent as `xdg_output.logical_size` for a mode of `physical` pixels at `scale`,
+/// for a client at `client_scale`, after `transform`. Rounded up, as the desktop module's
+/// `Space::output_geometry` rounds an output's logical size, so clients are told the same size the compositor's space uses and
+/// neighbouring outputs meet with no gap.
+fn xdg_logical_size(
+    physical: Size<i32, Physical>,
+    scale: f64,
+    client_scale: f64,
+    transform: Transform,
+) -> Size<i32, Client> {
+    let logical_size = physical
+        .to_f64()
+        .to_logical(scale)
+        .to_client(client_scale)
+        .to_i32_ceil();
+    transform.transform_size(logical_size)
 }
 
 #[derive(Debug, Clone)]
@@ -67,12 +85,12 @@ impl XdgOutput {
         xdg_output.logical_position(logical_position.x, logical_position.y);
 
         if let Some(size) = inner.physical_size {
-            let logical_size = size
-                .to_f64()
-                .to_logical(inner.scale.fractional_scale())
-                .to_client(client_scale)
-                .to_i32_round();
-            let transformed_size = inner.transform.transform_size(logical_size);
+            let transformed_size = xdg_logical_size(
+                size,
+                inner.scale.fractional_scale(),
+                client_scale,
+                inner.transform,
+            );
             xdg_output.logical_size(transformed_size.w, transformed_size.h);
         }
 
@@ -128,12 +146,12 @@ impl XdgOutput {
 
             if new_mode.is_some() || new_scale.is_some() || new_transform.is_some() || scale_changed {
                 if let Some(size) = output.physical_size {
-                    let logical_size = size
-                        .to_f64()
-                        .to_logical(output.scale.fractional_scale())
-                        .to_client(client_scale)
-                        .to_i32_round();
-                    let transformed_size = output.transform.transform_size(logical_size);
+                    let transformed_size = xdg_logical_size(
+                        size,
+                        output.scale.fractional_scale(),
+                        client_scale,
+                        output.transform,
+                    );
                     instance.logical_size(transformed_size.w, transformed_size.h);
                 }
             }
@@ -150,5 +168,22 @@ impl XdgOutput {
 
             // No need for wl_output.done() here, it will be called by caller (super::Output::change_current_state)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn logical_size_is_rounded_up_as_the_space_does() {
+        // 1920 / 1.75 = 1097.14 and 1200 / 1.75 = 685.71: up, never to nearest.
+        let size = xdg_logical_size((1920, 1200).into(), 1.75, 1.0, Transform::Normal);
+        assert_eq!((size.w, size.h), (1098, 686));
+        // Exact sizes stay exact.
+        let size = xdg_logical_size((2560, 1440).into(), 1.25, 1.0, Transform::Normal);
+        assert_eq!((size.w, size.h), (2048, 1152));
+        let size = xdg_logical_size((1920, 1200).into(), 1.75, 1.0, Transform::_90);
+        assert_eq!((size.w, size.h), (686, 1098));
     }
 }

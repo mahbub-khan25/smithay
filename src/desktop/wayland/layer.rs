@@ -53,21 +53,28 @@ pub fn layer_map_for_output(o: &Output) -> MutexGuard<'_, LayerMap> {
         Mutex::new(LayerMap {
             layers: IndexSet::new(),
             output: o.downgrade(),
-            zone: Rectangle::from_size(
-                o.current_mode()
-                    .map(|mode| {
-                        let logical_size = mode
-                            .size
-                            .to_f64()
-                            .to_logical(o.current_scale().fractional_scale())
-                            .to_i32_round();
-                        o.current_transform().transform_size(logical_size)
-                    })
-                    .unwrap_or_else(|| (0, 0).into()),
-            ),
+            zone: Rectangle::from_size(output_logical_size(o)),
         })
     });
     userdata.get::<Mutex<LayerMap>>().unwrap().lock().unwrap()
+}
+
+/// The logical size of `o` that its layer surfaces are arranged in: its mode over its scale,
+/// rounded up, then transformed. The same size as
+/// [`Space::output_geometry`](crate::desktop::Space::output_geometry), so a bar anchored to the
+/// right or bottom edge ends exactly at the output's edge in the space, and the zone it leaves
+/// meets the windows with no overlap. (0, 0) without a mode.
+fn output_logical_size(o: &Output) -> Size<i32, Logical> {
+    o.current_mode()
+        .map(|mode| {
+            let logical_size = mode
+                .size
+                .to_f64()
+                .to_logical(o.current_scale().fractional_scale())
+                .to_i32_ceil();
+            o.current_transform().transform_size(logical_size)
+        })
+        .unwrap_or_else(|| (0, 0).into())
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -253,19 +260,7 @@ impl LayerMap {
             let span = debug_span!("layer_map", output = output.name());
             let _guard = span.enter();
 
-            let output_rect = Rectangle::from_size(
-                output
-                    .current_mode()
-                    .map(|mode| {
-                        let logical_size = mode
-                            .size
-                            .to_f64()
-                            .to_logical(output.current_scale().fractional_scale())
-                            .to_i32_round();
-                        output.current_transform().transform_size(logical_size)
-                    })
-                    .unwrap_or_else(|| (0, 0).into()),
-            );
+            let output_rect = Rectangle::from_size(output_logical_size(&output));
             let zone = output_rect;
             let mut zone: Rectangle<_, Logical> = Rectangle::new(
                 Point::new(Saturating(zone.loc.x), Saturating(zone.loc.y)),
@@ -828,6 +823,40 @@ mod test {
             Size::new(zone.size.w.0, zone.size.h.0),
         );
         zone.size.w >= 0 && zone.size.h >= 0 && outer.contains_rect(zone)
+    }
+
+    #[test]
+    fn the_layer_map_is_as_big_as_the_space_at_fractional_scales() {
+        use crate::desktop::{Space, Window};
+        use crate::output::{Mode, PhysicalProperties, Scale, Subpixel};
+        for ((w, h), scale) in [((1920, 1200), 1.75), ((1920, 1080), 1.75), ((2560, 1440), 1.25)] {
+            let output = Output::new(
+                "test".into(),
+                PhysicalProperties {
+                    size: (0, 0).into(),
+                    subpixel: Subpixel::Unknown,
+                    make: "test".into(),
+                    model: "test".into(),
+                    serial_number: "test".into(),
+                },
+            );
+            output.change_current_state(
+                Some(Mode {
+                    size: (w, h).into(),
+                    refresh: 60_000,
+                }),
+                Some(crate::utils::Transform::Normal),
+                Some(Scale::Fractional(scale)),
+                Some((0, 0).into()),
+            );
+            let mut space: Space<Window> = Space::default();
+            space.map_output(&output, (0, 0));
+            let geometry = space.output_geometry(&output).unwrap();
+            let mut map = layer_map_for_output(&output);
+            assert_eq!(map.non_exclusive_zone().size, geometry.size, "{w}x{h} at {scale}");
+            map.arrange();
+            assert_eq!(map.non_exclusive_zone().size, geometry.size, "{w}x{h} at {scale}");
+        }
     }
 
     #[test]
