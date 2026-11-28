@@ -5,8 +5,9 @@
 //!
 //! ## Usage
 //!
-//! The backend is initialized using one of the [`init`], [`init_from_attributes`] or
-//! [`init_from_attributes_with_gl_attr`] functions, depending on the amount of control
+//! The backend is initialized using one of the [`init`], [`init_from_attributes`],
+//! [`init_from_attributes_with_gl_attr`] or [`init_from_attributes_with_gl_attr_and_renderer`]
+//! functions, depending on the amount of control
 //! you want on the initialization of the backend. These functions will provide you
 //! with two objects:
 //!
@@ -111,6 +112,60 @@ where
     R: From<GlesRenderer> + Bind<EGLSurface>,
     crate::backend::SwapBuffersError: From<R::Error>,
 {
+    init_from_attributes_with_gl_attr_and_renderer(attributes, gl_attributes, |context| {
+        // SAFETY: the context was made for the window's display on this thread and is
+        // current on no thread.
+        unsafe { GlesRenderer::new(context) }.map(R::from)
+    })
+}
+
+/// Create a new [`WinitGraphicsBackend`], as [`init_from_attributes_with_gl_attr`] does, with
+/// its renderer made by `make_renderer` from the window's [`EGLContext`].
+///
+/// [`init_from_attributes_with_gl_attr`] makes a [`GlesRenderer`] with every capability the
+/// context supports ([`GlesRenderer::new`]). Use this to choose them instead, for example with
+/// [`GlesRenderer::with_capabilities`]: the context is made with [`EGLContext::new_with_config`],
+/// so it shares its textures with no other context, and a renderer that never shares them can
+/// leave out [`Capability::Fencing`](crate::backend::renderer::gles::Capability::Fencing) and
+/// its GL fence after every texture draw.
+///
+/// `make_renderer` is called once, on this thread, with the context current on no thread.
+///
+/// ```no_run
+/// use smithay::backend::renderer::gles::{Capability, GlesRenderer};
+/// use smithay::backend::winit::{self, WinitGraphicsBackend};
+/// use smithay::backend::egl::context::GlAttributes;
+/// use smithay::reexports::winit::window::WindowAttributes;
+///
+/// let gl_attributes = GlAttributes {
+///     version: (3, 0),
+///     profile: None,
+///     debug: false,
+///     vsync: false,
+/// };
+/// let (backend, events): (WinitGraphicsBackend<GlesRenderer>, _) =
+///     winit::init_from_attributes_with_gl_attr_and_renderer(
+///         WindowAttributes::default(),
+///         gl_attributes,
+///         |context| {
+///             // SAFETY: the context is current on no thread and the renderer stays on this one.
+///             let supported = unsafe { GlesRenderer::supported_capabilities(&context) }?;
+///             let capabilities = supported.into_iter().filter(|c| *c != Capability::Fencing);
+///             unsafe { GlesRenderer::with_capabilities(context, capabilities) }
+///         },
+///     )
+///     .unwrap();
+/// ```
+pub fn init_from_attributes_with_gl_attr_and_renderer<R, F>(
+    attributes: WindowAttributes,
+    gl_attributes: GlAttributes,
+    make_renderer: F,
+) -> Result<(WinitGraphicsBackend<R>, WinitEventLoop), Error>
+where
+    R: Bind<EGLSurface>,
+    crate::backend::SwapBuffersError: From<R::Error>,
+    F: FnOnce(EGLContext) -> Result<R, GlesError>,
+{
     let span = info_span!("backend_winit", window = tracing::field::Empty);
     let _guard = span.enter();
     info!("Initializing a winit backend");
@@ -151,7 +206,7 @@ where
     debug!("Window created");
 
     let winit_graphics_backend =
-        WinitGraphicsBackend::new_with_gl_attr(window.clone(), &span, gl_attributes)?;
+        WinitGraphicsBackend::new_with_gl_attr(window.clone(), &span, gl_attributes, make_renderer)?;
 
     drop(_guard);
 
@@ -216,10 +271,8 @@ where
         window: Arc<dyn winit::window::Window>,
         span: &tracing::Span,
         gl_attributes: GlAttributes,
-    ) -> Result<Self, Error>
-    where
-        R: From<GlesRenderer>,
-    {
+        make_renderer: impl FnOnce(EGLContext) -> Result<R, GlesError>,
+    ) -> Result<Self, Error> {
         let (display, context, surface) = {
             let display = unsafe { EGLDisplay::new(window.clone())? };
 
@@ -274,7 +327,7 @@ where
             (display, context, surface)
         };
 
-        let renderer = unsafe { GlesRenderer::new(context)?.into() };
+        let renderer = make_renderer(context)?;
         let damage_tracking = display.supports_damage();
 
         Ok(WinitGraphicsBackend {
